@@ -1,3 +1,3 @@
-code,name,buy_date,buy_price,quantity,stop_loss,entry_score,entry_reasons,note
-1718,中纖,2026-07-24,12.50,1000,11.80,28,選股掃描器分數高；量增放量；KD向上,範例資料可刪除
-2330,台積電,2026-07-24,980,10,930,26,多方轉強；MACD翻紅；RSI站上50,範例資料可刪除
+﻿code,name,buy_date,buy_price,quantity,stop_loss,entry_score,entry_reasons,note,status,sell_date,sell_price,sell_reason
+1718,中纖,2026-07-24,12.5,1000,11.8,28,選股掃描器分數高；量增放量；KD向上,監控中範例,監控中,,0,
+2330,台積電,2026-07-20,980.0,1000,930.0,30,選股掃描器高分；MACD翻紅,已賣出範例，可刪除,已賣出,2026-07-24,1010,達停利，停止監控

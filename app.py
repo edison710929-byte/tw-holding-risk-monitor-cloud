@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-台股持股警訊監控器（雲端版 v3 自動帶出股票名稱版）
+台股持股警訊監控器（雲端版 v4 持股刪除／已賣出版）
 用途：買進後，依盤中量價與盤後技術指標監控是否出現重大警訊，輔助判斷續抱、留意、觀察、減碼或賣出警訊。
 
 部署：Streamlit Community Cloud
@@ -24,7 +24,7 @@ import streamlit as st
 # Streamlit 基本設定
 # -----------------------------
 st.set_page_config(
-    page_title="台股持股警訊監控器 v3",
+    page_title="台股持股警訊監控器 v4",
     page_icon="🚨",
     layout="wide",
 )
@@ -60,7 +60,8 @@ STOCK_NAME_FALLBACK = {
 }
 
 DEFAULT_HOLDING_COLUMNS = [
-    "code", "name", "buy_date", "buy_price", "quantity", "stop_loss", "entry_score", "entry_reasons", "note"
+    "code", "name", "buy_date", "buy_price", "quantity", "stop_loss", "entry_score",
+    "entry_reasons", "note", "status", "sell_date", "sell_price", "sell_reason"
 ]
 
 
@@ -114,15 +115,17 @@ def normalize_holdings_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         df = pd.DataFrame(columns=DEFAULT_HOLDING_COLUMNS)
     df = df.copy()
+    text_cols = ["code", "name", "buy_date", "entry_reasons", "note", "status", "sell_date", "sell_reason"]
+    num_cols = ["buy_price", "quantity", "stop_loss", "entry_score", "sell_price"]
     for c in DEFAULT_HOLDING_COLUMNS:
         if c not in df.columns:
-            df[c] = "" if c in ["code", "name", "buy_date", "entry_reasons", "note"] else 0
+            df[c] = "" if c in text_cols else 0
     df = df[DEFAULT_HOLDING_COLUMNS]
-    df["code"] = df["code"].astype(str).str.strip()
-    df["name"] = df["name"].astype(str).str.strip()
-    df["buy_date"] = df["buy_date"].astype(str).str.strip()
-    for c in ["buy_price", "quantity", "stop_loss", "entry_score"]:
+    for c in text_cols:
+        df[c] = df[c].astype(str).str.strip().replace({"nan": "", "NaT": "", "None": ""})
+    for c in num_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    df.loc[df["status"].eq(""), "status"] = "監控中"
     df = df[df["code"].astype(str).str.strip() != ""].reset_index(drop=True)
     return df
 
@@ -675,6 +678,45 @@ def init_holdings_state():
         st.session_state.monitor_stage = "input"
 
 
+def active_holdings_df(df: pd.DataFrame) -> pd.DataFrame:
+    h = normalize_holdings_df(df)
+    if h.empty:
+        return h
+    return h[h["status"].astype(str).str.strip().ne("已賣出")].reset_index(drop=True)
+
+
+def sold_holdings_df(df: pd.DataFrame) -> pd.DataFrame:
+    h = normalize_holdings_df(df)
+    if h.empty:
+        return h
+    return h[h["status"].astype(str).str.strip().eq("已賣出")].reset_index(drop=True)
+
+
+def holding_label(row: pd.Series, idx: int) -> str:
+    code = str(row.get("code", "")).strip()
+    name = str(row.get("name", "")).strip()
+    bp = safe_float(row.get("buy_price"), 0)
+    return f"{idx}｜{code} {name}｜買進 {bp:g}"
+
+
+def delete_holding_by_index(idx: int):
+    h = normalize_holdings_df(st.session_state.holdings_df)
+    if 0 <= idx < len(h):
+        st.session_state.holdings_df = h.drop(index=idx).reset_index(drop=True)
+        st.session_state.monitor_results = []
+
+
+def mark_holding_sold(idx: int, sell_date: date, sell_price: float, sell_reason: str):
+    h = normalize_holdings_df(st.session_state.holdings_df)
+    if 0 <= idx < len(h):
+        h.at[idx, "status"] = "已賣出"
+        h.at[idx, "sell_date"] = str(sell_date)
+        h.at[idx, "sell_price"] = float(sell_price or 0)
+        h.at[idx, "sell_reason"] = sell_reason or "已賣出，停止監控"
+        st.session_state.holdings_df = h.reset_index(drop=True)
+        st.session_state.monitor_results = []
+
+
 def append_holding(new_row: Dict):
     init_holdings_state()
     base = normalize_holdings_df(st.session_state.holdings_df)
@@ -729,6 +771,10 @@ def manual_add_form():
                 "entry_score": entry_score,
                 "entry_reasons": entry_reasons,
                 "note": note,
+                "status": "監控中",
+                "sell_date": "",
+                "sell_price": 0,
+                "sell_reason": "",
             })
             st.success(f"已加入 {code_clean} {name}")
 
@@ -737,7 +783,7 @@ def manual_add_form():
 def holdings_editor():
     init_holdings_state()
     st.subheader("目前持股清單")
-    st.caption("可以直接在表格中修改或刪除；也可以在空白列直接新增。")
+    st.caption("可以直接在表格中修改；若已賣出建議用下方『標記已賣出』保留紀錄，輸入錯誤再用『刪除持股』。")
     edited = st.data_editor(
         normalize_holdings_df(st.session_state.holdings_df),
         num_rows="dynamic",
@@ -752,12 +798,92 @@ def holdings_editor():
             "entry_score": st.column_config.NumberColumn("買進時分數", min_value=0.0, step=1.0),
             "entry_reasons": st.column_config.TextColumn("買進理由"),
             "note": st.column_config.TextColumn("備註"),
+            "status": st.column_config.SelectboxColumn("狀態", options=["監控中", "已賣出"], required=True),
+            "sell_date": st.column_config.TextColumn("賣出日期"),
+            "sell_price": st.column_config.NumberColumn("賣出價", min_value=0.0, step=0.05),
+            "sell_reason": st.column_config.TextColumn("賣出原因"),
         },
-        key="holdings_editor_v2",
+        key="holdings_editor_v4",
     )
     st.session_state.holdings_df = normalize_holdings_df(edited)
     return st.session_state.holdings_df
 
+
+def holding_action_panel():
+    h = normalize_holdings_df(st.session_state.holdings_df)
+    if h.empty:
+        return
+    st.subheader("持股操作")
+    st.caption("已經賣掉的股票，建議選『標記已賣出』，會保留交易紀錄並停止監控；輸入錯誤才用『刪除持股』。")
+
+    labels = [holding_label(row, i) for i, row in h.iterrows()]
+    selected_label = st.selectbox("選擇要處理的股票", labels, key="holding_action_select")
+    selected_idx = int(selected_label.split("｜", 1)[0])
+    selected_row = h.iloc[selected_idx]
+    selected_code = selected_row.get("code", "")
+    selected_name = selected_row.get("name", "")
+
+    action = st.radio("動作", ["標記已賣出／停止監控", "刪除持股（不保留紀錄）"], horizontal=True, key="holding_action_radio")
+
+    if action.startswith("標記"):
+        c1, c2 = st.columns(2)
+        sell_date = c1.date_input("賣出日期", value=date.today(), key="sold_date_input")
+        default_sell = safe_float(selected_row.get("sell_price"), 0)
+        if default_sell <= 0:
+            default_sell = safe_float(selected_row.get("buy_price"), 0)
+        sell_price = c2.number_input("賣出價", min_value=0.0, value=float(default_sell), step=0.05, format="%.2f", key="sold_price_input")
+        sell_reason = st.text_input("賣出原因", placeholder="例如：達停利、跌破5日線、爆量黑K、手動出場", key="sold_reason_input")
+        if st.button(f"確認標記已賣出：{selected_code} {selected_name}", type="primary"):
+            if sell_price <= 0:
+                st.error("請輸入賣出價，方便保留損益紀錄。")
+            else:
+                mark_holding_sold(selected_idx, sell_date, sell_price, sell_reason)
+                st.success(f"已將 {selected_code} {selected_name} 標記為已賣出，並停止監控。")
+                st.rerun()
+    else:
+        st.warning("刪除後不保留這筆持股紀錄。若是正常賣出，建議改用『標記已賣出』。")
+        confirm = st.checkbox(f"我確認要刪除 {selected_code} {selected_name}", key="delete_confirm")
+        if st.button("確認刪除持股", type="primary", disabled=not confirm):
+            delete_holding_by_index(selected_idx)
+            st.success(f"已刪除 {selected_code} {selected_name}。")
+            st.rerun()
+
+
+def sold_records_panel():
+    sold = sold_holdings_df(st.session_state.holdings_df)
+    st.subheader("已賣出紀錄")
+    if sold.empty:
+        st.caption("目前沒有已賣出紀錄。")
+        return
+    out = sold.copy()
+    out["realized_profit_pct"] = np.where(
+        out["buy_price"] > 0,
+        (out["sell_price"] - out["buy_price"]) / out["buy_price"] * 100,
+        np.nan,
+    )
+    view_cols = ["code", "name", "buy_date", "buy_price", "sell_date", "sell_price", "realized_profit_pct", "quantity", "sell_reason"]
+    st.dataframe(
+        out[view_cols],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "code": "股票代號",
+            "name": "股票名稱",
+            "buy_date": "買進日期",
+            "buy_price": st.column_config.NumberColumn("買進價", format="%.2f"),
+            "sell_date": "賣出日期",
+            "sell_price": st.column_config.NumberColumn("賣出價", format="%.2f"),
+            "realized_profit_pct": st.column_config.NumberColumn("實現損益%", format="%.2f%%"),
+            "quantity": "股數",
+            "sell_reason": "賣出原因",
+        },
+    )
+    st.download_button(
+        "下載已賣出紀錄 CSV",
+        data=out.to_csv(index=False).encode("utf-8-sig"),
+        file_name="已賣出紀錄.csv",
+        mime="text/csv",
+    )
 
 def holdings_input_page():
     init_holdings_state()
@@ -765,6 +891,10 @@ def holdings_input_page():
     manual_add_form()
     st.divider()
     holdings = holdings_editor()
+    st.divider()
+    holding_action_panel()
+    st.divider()
+    sold_records_panel()
 
     c1, c2, c3, c4 = st.columns([1, 1, 1.2, 2])
     if c1.button("清空持股資料"):
@@ -775,7 +905,8 @@ def holdings_input_page():
         append_holding({
             "code": "1718", "name": "中纖", "buy_date": str(date.today()), "buy_price": 12.50,
             "quantity": 1000, "stop_loss": 11.80, "entry_score": 28,
-            "entry_reasons": "選股掃描器分數高；量增放量；KD向上", "note": "範例資料可刪除"
+            "entry_reasons": "選股掃描器分數高；量增放量；KD向上", "note": "範例資料可刪除",
+            "status": "監控中", "sell_date": "", "sell_price": 0, "sell_reason": ""
         })
         st.rerun()
     if c3.button("自動補齊名稱"):
@@ -785,10 +916,11 @@ def holdings_input_page():
     go = c4.button("儲存並進入監控器", type="primary", use_container_width=True)
     if go:
         holdings = autofill_holding_names(st.session_state.holdings_df)
-        if holdings.empty:
-            st.error("請至少新增一檔持股。")
-        elif (holdings["buy_price"] <= 0).any():
-            st.error("所有持股都要輸入買進價，才能計算損益與風險。")
+        active = active_holdings_df(holdings)
+        if active.empty:
+            st.error("目前沒有監控中的持股。請新增持股，或把狀態改成『監控中』。")
+        elif (active["buy_price"] <= 0).any():
+            st.error("所有監控中持股都要輸入買進價，才能計算損益與風險。")
         else:
             st.session_state.holdings_df = holdings
             st.session_state.monitor_stage = "monitor"
@@ -797,7 +929,8 @@ def holdings_input_page():
 
 def monitor_page(hist_range: str, auto_refresh: bool):
     init_holdings_state()
-    holdings = normalize_holdings_df(st.session_state.holdings_df)
+    all_holdings = normalize_holdings_df(st.session_state.holdings_df)
+    holdings = active_holdings_df(all_holdings)
 
     top1, top2 = st.columns([1, 3])
     if top1.button("← 返回持股輸入"):
@@ -806,11 +939,16 @@ def monitor_page(hist_range: str, auto_refresh: bool):
     top2.caption("第 2 步：進入監控器後，按『開始檢查持股警訊』取得盤中／盤後警訊與建議動作。")
 
     if holdings.empty:
-        st.warning("目前沒有持股資料，請返回持股輸入。")
+        st.warning("目前沒有監控中的持股，請返回持股輸入。")
         return
 
-    st.subheader("待監控持股")
+    st.subheader("監控中持股")
+    st.caption("狀態為『已賣出』的股票不會進入警訊監控。")
     st.dataframe(holdings, use_container_width=True, hide_index=True)
+    sold = sold_holdings_df(all_holdings)
+    if not sold.empty:
+        with st.expander(f"已賣出／停止監控紀錄：{len(sold)} 檔"):
+            sold_records_panel()
 
     run = st.button("開始檢查持股警訊", type="primary")
     if auto_refresh:
@@ -928,7 +1066,7 @@ def render_result_cards(results: List[Dict]):
 
 
 def render_rules():
-    st.subheader("v3 風險分數規則")
+    st.subheader("v4 風險分數與持股管理規則")
     st.markdown(
         """
 這套工具跟前面的選股掃描器相反：**風險分數越高越危險**。
@@ -942,6 +1080,8 @@ def render_rules():
 | 86～100 | 重大警訊：優先處理 |
 
 主要警訊包含：跌破買進價、跌破開盤價、跌破昨收、從高點回落、長上影、爆量壓回、跌破停損價、爆量黑K、跌破5/10日線、放量下跌、KD/KDJ轉下、MACD轉弱、RSI跌破50、CCI跌破+100、-DI轉強、A/DI或VA-OSC背離、%B跌破0.5、MTM/ROC轉負、NVI/PVI下滑等。
+
+**持股管理建議：**正常賣出請使用「標記已賣出／停止監控」，系統會保留買進價、賣出價、賣出原因與實現損益；只有輸入錯誤或完全不想保留紀錄時，才使用「刪除持股」。
         """
     )
 
@@ -949,8 +1089,8 @@ def render_rules():
 def main():
     css()
     init_holdings_state()
-    st.markdown('<div class="big-title">🚨 台股持股警訊監控器 v3</div>', unsafe_allow_html=True)
-    st.markdown('<div class="subtle">買進後監控盤中或盤後重大警訊。v3 改為只輸入股票代號即可自動帶出中文股票名稱；完成後再進入監控器。</div>', unsafe_allow_html=True)
+    st.markdown('<div class="big-title">🚨 台股持股警訊監控器 v4</div>', unsafe_allow_html=True)
+    st.markdown('<div class="subtle">買進後監控盤中或盤後重大警訊。v4 新增「標記已賣出／停止監控」與「刪除持股」功能，已賣出股票會保留紀錄但不再監控。</div>', unsafe_allow_html=True)
 
     with st.sidebar:
         st.header("設定")
