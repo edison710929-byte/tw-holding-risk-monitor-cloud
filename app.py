@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-台股持股警訊監控器（雲端版 v1）
+台股持股警訊監控器（雲端版 v3 自動帶出股票名稱版）
 用途：買進後，依盤中量價與盤後技術指標監控是否出現重大警訊，輔助判斷續抱、留意、觀察、減碼或賣出警訊。
 
 部署：Streamlit Community Cloud
@@ -24,7 +24,7 @@ import streamlit as st
 # Streamlit 基本設定
 # -----------------------------
 st.set_page_config(
-    page_title="台股持股警訊監控器 v1",
+    page_title="台股持股警訊監控器 v3",
     page_icon="🚨",
     layout="wide",
 )
@@ -139,6 +139,85 @@ def load_uploaded_holdings(uploaded_file) -> pd.DataFrame:
     except Exception as e:
         st.error(f"讀取持股檔失敗：{e}")
         return pd.DataFrame(columns=DEFAULT_HOLDING_COLUMNS)
+
+
+def _pick_first_existing(row: Dict, keys: List[str]) -> str:
+    """從不同公開資料欄位格式中，取出第一個存在且非空白的值。"""
+    for k in keys:
+        if k in row and str(row.get(k, "")).strip():
+            return str(row.get(k, "")).strip()
+    return ""
+
+
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
+def fetch_public_stock_name_map() -> Dict[str, str]:
+    """抓上市/上櫃公開資料的股票代號與中文名稱。
+
+    不同來源欄位名稱可能不同，所以用多組欄位名稱做彈性判讀。
+    若雲端服務或網路暫時抓不到，仍會回傳內建備援名稱表。
+    """
+    name_map: Dict[str, str] = dict(STOCK_NAME_FALLBACK)
+    endpoints = [
+        # TWSE 上市全市場日行情，常見欄位：Code、Name
+        "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
+        # TPEx 上櫃公開資料，欄位可能隨資料集版本不同而有差異
+        "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes",
+        "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes",
+    ]
+    code_keys = [
+        "Code", "code", "證券代號", "股票代號", "有價證券代號", "SecuritiesCompanyCode",
+        "CompanyCode", "SecurityCode", "SecuritiesCode", "股票證券代號",
+    ]
+    name_keys = [
+        "Name", "name", "證券名稱", "股票名稱", "有價證券名稱", "CompanyName",
+        "SecurityName", "SecuritiesName", "公司名稱", "簡稱",
+    ]
+    for url in endpoints:
+        try:
+            r = requests.get(url, headers=REQUEST_HEADERS, timeout=10)
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            if isinstance(data, dict):
+                # 有些 OpenAPI 會包在 data/result 裡
+                for key in ["data", "result", "items"]:
+                    if isinstance(data.get(key), list):
+                        data = data[key]
+                        break
+            if not isinstance(data, list):
+                continue
+            for row in data:
+                if not isinstance(row, dict):
+                    continue
+                code = _pick_first_existing(row, code_keys)
+                name = _pick_first_existing(row, name_keys)
+                code = clean_code(code).split(".")[0]
+                if code.isdigit() and len(code) == 4 and name:
+                    # 排除太不像中文股票名的值，但保留 KY、* 等合法名稱字元
+                    name_map[code] = name.strip()
+        except Exception:
+            continue
+    return name_map
+
+
+def resolve_stock_name(code: str) -> str:
+    c = clean_code(code).split(".")[0]
+    if not c:
+        return ""
+    name_map = fetch_public_stock_name_map()
+    return name_map.get(c, STOCK_NAME_FALLBACK.get(c, ""))
+
+
+def autofill_holding_names(df: pd.DataFrame) -> pd.DataFrame:
+    out = normalize_holdings_df(df)
+    if out.empty:
+        return out
+    for idx, row in out.iterrows():
+        code = str(row.get("code", "")).strip()
+        name = str(row.get("name", "")).strip()
+        if code and (not name or name.lower() == "nan"):
+            out.at[idx, "name"] = resolve_stock_name(code)
+    return out
 
 
 # -----------------------------
@@ -388,7 +467,7 @@ def risk_recommendation(score: int, severe_count: int, stop_loss_hit: bool = Fal
 def evaluate_holding(row: pd.Series, hist_range: str = "6mo") -> Dict:
     code = str(row.get("code", "")).strip()
     raw_name = str(row.get("name", "")).strip()
-    name = raw_name if raw_name and raw_name.lower() != "nan" else STOCK_NAME_FALLBACK.get(code.split(".")[0], "")
+    name = raw_name if raw_name and raw_name.lower() != "nan" else resolve_stock_name(code)
     buy_price = safe_float(row.get("buy_price"), 0)
     quantity = safe_float(row.get("quantity"), 0)
     stop_loss = safe_float(row.get("stop_loss"), 0)
@@ -585,53 +664,193 @@ def css():
     )
 
 
-def make_template() -> pd.DataFrame:
-    return pd.DataFrame([
-        {
-            "code": "1718", "name": "中纖", "buy_date": str(date.today()), "buy_price": 12.50,
-            "quantity": 1000, "stop_loss": 11.80, "entry_score": 28,
-            "entry_reasons": "選股掃描器分數高；量增放量；KD向上", "note": "範例資料可刪除"
-        }
-    ])
+def make_empty_holdings() -> pd.DataFrame:
+    return pd.DataFrame(columns=DEFAULT_HOLDING_COLUMNS)
 
 
-def editable_holdings_section():
-    st.sidebar.header("持股資料")
-    uploaded = st.sidebar.file_uploader("上傳持股 CSV / Excel", type=["csv", "xlsx"])
+def init_holdings_state():
     if "holdings_df" not in st.session_state:
-        st.session_state.holdings_df = make_template()
+        st.session_state.holdings_df = make_empty_holdings()
+    if "monitor_stage" not in st.session_state:
+        st.session_state.monitor_stage = "input"
 
-    if uploaded is not None:
-        st.session_state.holdings_df = load_uploaded_holdings(uploaded)
-        st.sidebar.success("已載入上傳持股檔")
 
-    c1, c2 = st.sidebar.columns(2)
-    if c1.button("載入範例"):
-        st.session_state.holdings_df = make_template()
-    if c2.button("清空"):
-        st.session_state.holdings_df = pd.DataFrame(columns=DEFAULT_HOLDING_COLUMNS)
+def append_holding(new_row: Dict):
+    init_holdings_state()
+    base = normalize_holdings_df(st.session_state.holdings_df)
+    added = normalize_holdings_df(pd.DataFrame([new_row]))
+    if not added.empty:
+        st.session_state.holdings_df = normalize_holdings_df(pd.concat([base, added], ignore_index=True))
 
-    st.sidebar.caption("欄位說明：code 股票代號、buy_price 買進價、stop_loss 停損價、entry_score 買進時掃描器分數。")
 
+def manual_add_form():
+    st.subheader("新增持股")
+    st.caption("只要輸入股票代號，股票名稱會自動帶出；完成後再進入監控器。")
+
+    c1, c2 = st.columns(2)
+    code = c1.text_input("股票代號 *", placeholder="例如 1718", key="manual_code")
+    code_clean = clean_code(code)
+    auto_name = resolve_stock_name(code_clean) if code_clean else ""
+    c2.markdown("**股票名稱（自動帶出）**")
+    if code_clean and auto_name:
+        c2.success(auto_name)
+    elif code_clean:
+        c2.warning("暫時查不到名稱，加入後仍可監控；也可稍後按『自動補齊名稱』。")
+    else:
+        c2.info("輸入股票代號後自動帶出")
+
+    c3, c4 = st.columns(2)
+    buy_date = c3.date_input("買進日期", value=date.today(), key="manual_buy_date")
+    buy_price = c4.number_input("買進價 *", min_value=0.0, value=0.0, step=0.05, format="%.2f", key="manual_buy_price")
+
+    c5, c6, c7 = st.columns(3)
+    quantity = c5.number_input("股數", min_value=0.0, value=1000.0, step=100.0, key="manual_quantity")
+    stop_loss = c6.number_input("停損價", min_value=0.0, value=0.0, step=0.05, format="%.2f", key="manual_stop_loss")
+    entry_score = c7.number_input("買進時掃描器分數", min_value=0.0, value=0.0, step=1.0, key="manual_entry_score")
+
+    entry_reasons = st.text_area("買進理由", placeholder="例如：選股掃描器高分、量增放量、KD向上、MACD翻紅", key="manual_entry_reasons")
+    note = st.text_input("備註", placeholder="可空白", key="manual_note")
+
+    submitted = st.button("加入持股清單", type="primary")
+    if submitted:
+        if not code_clean:
+            st.error("請至少輸入股票代號。")
+        elif buy_price <= 0:
+            st.error("請輸入買進價。")
+        else:
+            name = auto_name or resolve_stock_name(code_clean)
+            append_holding({
+                "code": code_clean,
+                "name": name,
+                "buy_date": str(buy_date),
+                "buy_price": buy_price,
+                "quantity": quantity,
+                "stop_loss": stop_loss,
+                "entry_score": entry_score,
+                "entry_reasons": entry_reasons,
+                "note": note,
+            })
+            st.success(f"已加入 {code_clean} {name}")
+
+
+
+def holdings_editor():
+    init_holdings_state()
+    st.subheader("目前持股清單")
+    st.caption("可以直接在表格中修改或刪除；也可以在空白列直接新增。")
     edited = st.data_editor(
         normalize_holdings_df(st.session_state.holdings_df),
         num_rows="dynamic",
         use_container_width=True,
         column_config={
-            "code": st.column_config.TextColumn("股票代號", help="例如 1718、2330"),
+            "code": st.column_config.TextColumn("股票代號", help="例如 1718、2330", required=True),
             "name": st.column_config.TextColumn("股票名稱"),
             "buy_date": st.column_config.TextColumn("買進日期"),
-            "buy_price": st.column_config.NumberColumn("買進價", min_value=0.0, step=0.05),
+            "buy_price": st.column_config.NumberColumn("買進價", min_value=0.0, step=0.05, required=True),
             "quantity": st.column_config.NumberColumn("股數", min_value=0.0, step=100.0),
             "stop_loss": st.column_config.NumberColumn("停損價", min_value=0.0, step=0.05),
             "entry_score": st.column_config.NumberColumn("買進時分數", min_value=0.0, step=1.0),
             "entry_reasons": st.column_config.TextColumn("買進理由"),
             "note": st.column_config.TextColumn("備註"),
         },
-        key="holdings_editor",
+        key="holdings_editor_v2",
     )
     st.session_state.holdings_df = normalize_holdings_df(edited)
     return st.session_state.holdings_df
+
+
+def holdings_input_page():
+    init_holdings_state()
+    st.info("第 1 步：先新增或編輯持股資料。完成後按『儲存並進入監控器』。")
+    manual_add_form()
+    st.divider()
+    holdings = holdings_editor()
+
+    c1, c2, c3, c4 = st.columns([1, 1, 1.2, 2])
+    if c1.button("清空持股資料"):
+        st.session_state.holdings_df = make_empty_holdings()
+        st.session_state.monitor_results = []
+        st.rerun()
+    if c2.button("載入一筆範例"):
+        append_holding({
+            "code": "1718", "name": "中纖", "buy_date": str(date.today()), "buy_price": 12.50,
+            "quantity": 1000, "stop_loss": 11.80, "entry_score": 28,
+            "entry_reasons": "選股掃描器分數高；量增放量；KD向上", "note": "範例資料可刪除"
+        })
+        st.rerun()
+    if c3.button("自動補齊名稱"):
+        st.session_state.holdings_df = autofill_holding_names(st.session_state.holdings_df)
+        st.success("已依股票代號補齊可查到的中文名稱。")
+        st.rerun()
+    go = c4.button("儲存並進入監控器", type="primary", use_container_width=True)
+    if go:
+        holdings = autofill_holding_names(st.session_state.holdings_df)
+        if holdings.empty:
+            st.error("請至少新增一檔持股。")
+        elif (holdings["buy_price"] <= 0).any():
+            st.error("所有持股都要輸入買進價，才能計算損益與風險。")
+        else:
+            st.session_state.holdings_df = holdings
+            st.session_state.monitor_stage = "monitor"
+            st.rerun()
+
+
+def monitor_page(hist_range: str, auto_refresh: bool):
+    init_holdings_state()
+    holdings = normalize_holdings_df(st.session_state.holdings_df)
+
+    top1, top2 = st.columns([1, 3])
+    if top1.button("← 返回持股輸入"):
+        st.session_state.monitor_stage = "input"
+        st.rerun()
+    top2.caption("第 2 步：進入監控器後，按『開始檢查持股警訊』取得盤中／盤後警訊與建議動作。")
+
+    if holdings.empty:
+        st.warning("目前沒有持股資料，請返回持股輸入。")
+        return
+
+    st.subheader("待監控持股")
+    st.dataframe(holdings, use_container_width=True, hide_index=True)
+
+    run = st.button("開始檢查持股警訊", type="primary")
+    if auto_refresh:
+        run = True
+        try:
+            st.autorefresh(interval=60 * 1000, key="refresh")
+        except Exception:
+            pass
+
+    if run:
+        results = []
+        progress = st.progress(0)
+        for i, (_, row) in enumerate(holdings.iterrows(), start=1):
+            with st.spinner(f"檢查 {row.get('code')} 中..."):
+                results.append(evaluate_holding(row, hist_range=hist_range))
+            progress.progress(i / max(len(holdings), 1))
+        st.session_state.monitor_results = results
+
+    results = st.session_state.get("monitor_results", [])
+    if results:
+        summary = build_summary_df(results)
+        st.subheader("持股總覽")
+        st.dataframe(
+            summary,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "損益%": st.column_config.NumberColumn(format="%.2f%%"),
+                "買進價": st.column_config.NumberColumn(format="%.2f"),
+                "現價": st.column_config.NumberColumn(format="%.2f"),
+            },
+        )
+        st.download_button(
+            "下載本次警訊結果 CSV",
+            data=summary.to_csv(index=False).encode("utf-8-sig"),
+            file_name="持股警訊監控結果.csv",
+            mime="text/csv",
+        )
+        st.subheader("單檔詳細警訊")
+        render_result_cards(results)
 
 
 def build_summary_df(results: List[Dict]) -> pd.DataFrame:
@@ -709,7 +928,7 @@ def render_result_cards(results: List[Dict]):
 
 
 def render_rules():
-    st.subheader("v1 風險分數規則")
+    st.subheader("v3 風險分數規則")
     st.markdown(
         """
 這套工具跟前面的選股掃描器相反：**風險分數越高越危險**。
@@ -729,8 +948,9 @@ def render_rules():
 
 def main():
     css()
-    st.markdown('<div class="big-title">🚨 台股持股警訊監控器 v1</div>', unsafe_allow_html=True)
-    st.markdown('<div class="subtle">買進後監控盤中或盤後重大警訊，輔助判斷續抱、留意、觀察、減碼或賣出警訊。此工具是技術面快篩，不是下單建議。</div>', unsafe_allow_html=True)
+    init_holdings_state()
+    st.markdown('<div class="big-title">🚨 台股持股警訊監控器 v3</div>', unsafe_allow_html=True)
+    st.markdown('<div class="subtle">買進後監控盤中或盤後重大警訊。v3 改為只輸入股票代號即可自動帶出中文股票名稱；完成後再進入監控器。</div>', unsafe_allow_html=True)
 
     with st.sidebar:
         st.header("設定")
@@ -741,83 +961,27 @@ def main():
             st.cache_data.clear()
             st.success("已清除快取，請重新檢查。")
 
-    tab1, tab2, tab3 = st.tabs(["持股監控", "匯入匯出", "評分規則"])
+        st.divider()
+        st.write("目前頁面：", "持股輸入" if st.session_state.monitor_stage == "input" else "監控器")
+        if st.button("切換到持股輸入"):
+            st.session_state.monitor_stage = "input"
+            st.rerun()
+        if st.button("切換到監控器"):
+            st.session_state.monitor_stage = "monitor"
+            st.rerun()
+
+    tab1, tab2 = st.tabs(["持股輸入 / 監控", "評分規則"])
 
     with tab1:
-        holdings = editable_holdings_section()
-        if holdings.empty:
-            st.info("請先在表格中輸入持股資料，至少要填股票代號與買進價。")
+        if st.session_state.monitor_stage == "input":
+            holdings_input_page()
         else:
-            run = st.button("開始檢查持股警訊", type="primary")
-            if auto_refresh:
-                run = True
-                try:
-                    st.autorefresh(interval=60 * 1000, key="refresh")
-                except Exception:
-                    pass
-
-            if run:
-                results = []
-                progress = st.progress(0)
-                for i, (_, row) in enumerate(holdings.iterrows(), start=1):
-                    with st.spinner(f"檢查 {row.get('code')} 中..."):
-                        results.append(evaluate_holding(row, hist_range=hist_range))
-                    progress.progress(i / max(len(holdings), 1))
-                st.session_state.monitor_results = results
-
-            results = st.session_state.get("monitor_results", [])
-            if results:
-                summary = build_summary_df(results)
-                st.subheader("持股總覽")
-                st.dataframe(
-                    summary,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "損益%": st.column_config.NumberColumn(format="%.2f%%"),
-                        "買進價": st.column_config.NumberColumn(format="%.2f"),
-                        "現價": st.column_config.NumberColumn(format="%.2f"),
-                    },
-                )
-                st.download_button(
-                    "下載本次警訊結果 CSV",
-                    data=summary.to_csv(index=False).encode("utf-8-sig"),
-                    file_name="持股警訊監控結果.csv",
-                    mime="text/csv",
-                )
-                st.subheader("單檔詳細警訊")
-                render_result_cards(results)
+            monitor_page(hist_range, auto_refresh)
 
     with tab2:
-        st.subheader("持股檔格式")
-        st.write("你可以下載範本，之後在 Excel 修改後再上傳。")
-        template = make_template()
-        st.download_button(
-            "下載持股清單範本 CSV",
-            data=template.to_csv(index=False).encode("utf-8-sig"),
-            file_name="持股清單範本.csv",
-            mime="text/csv",
-        )
-        st.dataframe(template, use_container_width=True, hide_index=True)
-        st.markdown(
-            """
-欄位說明：
-- `code`：股票代號，例如 1718、2330。
-- `name`：股票名稱，可空白，系統會用內建常見名稱補。
-- `buy_date`：買進日期。
-- `buy_price`：買進價，計算損益與跌破成本警訊用。
-- `quantity`：股數，可用於備註與後續擴充。
-- `stop_loss`：停損價，跌破會列為重大警訊。
-- `entry_score`：買進時選股掃描器分數，幫助判斷原買進理由是否失效。
-- `entry_reasons`：買進理由，例如量增放量、KD向上、MACD翻紅。
-            """
-        )
-
-    with tab3:
         render_rules()
 
     st.caption("提醒：此工具依公開行情與技術指標計算，資料可能延遲或中斷；請勿把結果當成唯一買賣依據。")
-
 
 if __name__ == "__main__":
     main()
