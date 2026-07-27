@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-台股持股警訊監控器（雲端版 v4 持股刪除／已賣出版）
+台股持股警訊監控器（雲端版 v5 瀏覽器本機儲存版）
 用途：買進後，依盤中量價與盤後技術指標監控是否出現重大警訊，輔助判斷續抱、留意、觀察、減碼或賣出警訊。
+新增：持股資料會儲存在目前瀏覽器的 localStorage，重新開啟同一網址時會自動帶回。
 
 部署：Streamlit Community Cloud
 主程式：app.py
@@ -10,6 +11,8 @@
 from __future__ import annotations
 
 import math
+import json
+import hashlib
 from dataclasses import dataclass
 from datetime import date
 from typing import Dict, List, Optional, Tuple
@@ -18,13 +21,19 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
+
+try:
+    from streamlit_js_eval import streamlit_js_eval
+except Exception:
+    streamlit_js_eval = None
 
 
 # -----------------------------
 # Streamlit 基本設定
 # -----------------------------
 st.set_page_config(
-    page_title="台股持股警訊監控器 v4",
+    page_title="台股持股警訊監控器 v5",
     page_icon="🚨",
     layout="wide",
 )
@@ -58,6 +67,8 @@ STOCK_NAME_FALLBACK = {
     "5371": "中光電", "5483": "中美晶", "6187": "萬潤", "6488": "環球晶", "8069": "元太",
     "8086": "宏捷科", "8299": "群聯",
 }
+
+BROWSER_STORAGE_KEY = "tw_holding_risk_monitor_v5_holdings"
 
 DEFAULT_HOLDING_COLUMNS = [
     "code", "name", "buy_date", "buy_price", "quantity", "stop_loss", "entry_score",
@@ -671,11 +682,124 @@ def make_empty_holdings() -> pd.DataFrame:
     return pd.DataFrame(columns=DEFAULT_HOLDING_COLUMNS)
 
 
+
+
+def holdings_to_records_json(df: pd.DataFrame) -> str:
+    """把持股資料轉成可存入瀏覽器 localStorage 的 JSON 字串。"""
+    h = normalize_holdings_df(df)
+    # 只保留固定欄位，避免 data_editor 產生額外欄位造成版本不相容
+    records = h[DEFAULT_HOLDING_COLUMNS].to_dict(orient="records")
+    return json.dumps(records, ensure_ascii=False, separators=(",", ":"))
+
+
+def holdings_from_records_json(raw: str) -> pd.DataFrame:
+    """從瀏覽器 localStorage/備份檔的 JSON 還原持股資料。"""
+    if not raw:
+        return make_empty_holdings()
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict) and "holdings" in data:
+            data = data["holdings"]
+        if not isinstance(data, list):
+            return make_empty_holdings()
+        return normalize_holdings_df(pd.DataFrame(data))
+    except Exception:
+        return make_empty_holdings()
+
+
+def storage_available() -> bool:
+    return streamlit_js_eval is not None
+
+
+def load_holdings_from_browser_once():
+    """第一次進入時，從目前瀏覽器 localStorage 載入持股資料。"""
+    if st.session_state.get("browser_storage_loaded", False):
+        return
+    if not storage_available():
+        st.session_state.browser_storage_loaded = True
+        st.session_state.browser_storage_status = "本機儲存元件未載入，暫時只使用本次頁面資料。"
+        return
+
+    raw = streamlit_js_eval(
+        js_expressions=f"localStorage.getItem('{BROWSER_STORAGE_KEY}') || '__EMPTY__'",
+        key="load_browser_holdings_v5",
+    )
+    if raw is None:
+        st.info("正在讀取瀏覽器本機儲存資料，若畫面未自動更新，請稍等幾秒後按一下重新整理。")
+        return
+
+    st.session_state.browser_storage_loaded = True
+    if raw != "__EMPTY__":
+        restored = holdings_from_records_json(raw)
+        if not restored.empty:
+            st.session_state.holdings_df = restored
+            st.session_state.browser_storage_status = f"已從瀏覽器本機儲存載入 {len(restored)} 筆持股資料。"
+            st.rerun()
+        else:
+            st.session_state.browser_storage_status = "瀏覽器中有舊資料，但格式無法還原，已略過。"
+    else:
+        st.session_state.browser_storage_status = "此瀏覽器尚無已儲存持股資料。"
+
+
+def save_holdings_to_browser():
+    """將目前持股資料自動寫入瀏覽器 localStorage。"""
+    if not st.session_state.get("browser_storage_loaded", False):
+        return
+    if not storage_available():
+        return
+    payload = holdings_to_records_json(st.session_state.get("holdings_df", make_empty_holdings()))
+    checksum = hashlib.md5(payload.encode("utf-8")).hexdigest()[:12]
+    # 用不同 key 讓 Streamlit 在資料變動後確實執行新的 JS；不改變畫面高度
+    streamlit_js_eval(
+        js_expressions=f"localStorage.setItem('{BROWSER_STORAGE_KEY}', {json.dumps(payload, ensure_ascii=False)}); true;",
+        key=f"save_browser_holdings_{checksum}",
+    )
+
+
+def clear_browser_storage_js():
+    """清除目前瀏覽器 localStorage 中的持股資料。"""
+    if not storage_available():
+        return
+    streamlit_js_eval(
+        js_expressions=f"localStorage.removeItem('{BROWSER_STORAGE_KEY}'); true;",
+        key=f"clear_browser_holdings_{date.today().isoformat()}_{hashlib.md5(str(pd.Timestamp.now()).encode()).hexdigest()[:8]}",
+    )
+
+
+def backup_restore_panel():
+    st.subheader("資料備份 / 還原")
+    st.caption("持股會自動存到目前瀏覽器；但若換手機、換瀏覽器或清除 Safari 網站資料，仍可能消失。建議偶爾下載備份。")
+    current_json = holdings_to_records_json(st.session_state.get("holdings_df", make_empty_holdings()))
+    st.download_button(
+        "下載持股備份 JSON",
+        data=current_json.encode("utf-8"),
+        file_name="台股持股警訊監控器_持股備份.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+    uploaded = st.file_uploader("匯入持股備份 JSON", type=["json"], key="restore_json_upload")
+    if uploaded is not None:
+        if st.button("確認匯入備份並覆蓋目前資料", type="primary"):
+            try:
+                raw = uploaded.read().decode("utf-8")
+                restored = holdings_from_records_json(raw)
+                st.session_state.holdings_df = restored
+                st.session_state.monitor_results = []
+                st.session_state.browser_storage_loaded = True
+                st.success(f"已匯入 {len(restored)} 筆資料，並會自動存入此瀏覽器。")
+                st.rerun()
+            except Exception as e:
+                st.error(f"匯入失敗：{e}")
+
 def init_holdings_state():
     if "holdings_df" not in st.session_state:
         st.session_state.holdings_df = make_empty_holdings()
     if "monitor_stage" not in st.session_state:
         st.session_state.monitor_stage = "input"
+    if "browser_storage_loaded" not in st.session_state:
+        st.session_state.browser_storage_loaded = False
+    if "browser_storage_status" not in st.session_state:
+        st.session_state.browser_storage_status = "尚未讀取瀏覽器本機儲存。"
 
 
 def active_holdings_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -895,11 +1019,14 @@ def holdings_input_page():
     holding_action_panel()
     st.divider()
     sold_records_panel()
+    st.divider()
+    backup_restore_panel()
 
     c1, c2, c3, c4 = st.columns([1, 1, 1.2, 2])
     if c1.button("清空持股資料"):
         st.session_state.holdings_df = make_empty_holdings()
         st.session_state.monitor_results = []
+        st.session_state.browser_storage_loaded = True
         st.rerun()
     if c2.button("載入一筆範例"):
         append_holding({
@@ -1066,10 +1193,12 @@ def render_result_cards(results: List[Dict]):
 
 
 def render_rules():
-    st.subheader("v4 風險分數與持股管理規則")
+    st.subheader("v5 風險分數、持股管理與本機儲存規則")
     st.markdown(
         """
 這套工具跟前面的選股掃描器相反：**風險分數越高越危險**。
+
+v5 新增：持股資料會自動儲存在目前瀏覽器的本機儲存空間（localStorage）。同一支手機、同一個瀏覽器再次打開同一網址時，會自動載入上次輸入的持股。
 
 | 風險分數 | 判斷 |
 |---:|---|
@@ -1089,14 +1218,18 @@ def render_rules():
 def main():
     css()
     init_holdings_state()
-    st.markdown('<div class="big-title">🚨 台股持股警訊監控器 v4</div>', unsafe_allow_html=True)
-    st.markdown('<div class="subtle">買進後監控盤中或盤後重大警訊。v4 新增「標記已賣出／停止監控」與「刪除持股」功能，已賣出股票會保留紀錄但不再監控。</div>', unsafe_allow_html=True)
+    st.markdown('<div class="big-title">🚨 台股持股警訊監控器 v5</div>', unsafe_allow_html=True)
+    st.markdown('<div class="subtle">買進後監控盤中或盤後重大警訊。v5 新增瀏覽器本機儲存，重新打開同一網址時會自動帶回持股資料。</div>', unsafe_allow_html=True)
+    load_holdings_from_browser_once()
+    if st.session_state.get("browser_storage_status"):
+        st.caption(st.session_state.browser_storage_status)
 
     with st.sidebar:
         st.header("設定")
         hist_range = st.selectbox("歷史資料區間", ["3mo", "6mo", "1y"], index=1)
         auto_refresh = st.checkbox("盤中自動更新（約60秒）", value=False)
         st.caption("雲端版資料可能有延遲；實際下單前請以券商APP確認。")
+        st.caption("持股資料儲存在目前瀏覽器；不同手機或不同瀏覽器不會同步。")
         if st.button("清除行情快取"):
             st.cache_data.clear()
             st.success("已清除快取，請重新檢查。")
@@ -1121,6 +1254,7 @@ def main():
     with tab2:
         render_rules()
 
+    save_holdings_to_browser()
     st.caption("提醒：此工具依公開行情與技術指標計算，資料可能延遲或中斷；請勿把結果當成唯一買賣依據。")
 
 if __name__ == "__main__":
